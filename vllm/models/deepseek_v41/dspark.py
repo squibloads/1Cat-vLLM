@@ -43,7 +43,12 @@ from .markov_fused import MarkovGreedy, markov_bias
 from .markov_shard import MarkovShardGreedy
 from .model import V41Attention, V41Block, V41MoE, V41Norm, _SharedAttention
 from .quant_rope import apply_rope, attention_qdq, rope_table
-from .query_graph import V41ContextGraphs, V41GreedyDraftGraph, V41QueryGraph
+from .query_graph import (
+    V41ContextGraphs,
+    V41CoupledDraftGraph,
+    V41GreedyDraftGraph,
+    V41QueryGraph,
+)
 
 _BATCH_CONTEXT = envs.VLLM_V41_BATCH == "1"
 # VLLM_V41_DRAFT_FUSED: draft layers use the target's fused HC transitions.
@@ -60,6 +65,13 @@ _DRAFT_HEAD_FP8 = envs.VLLM_V41_DRAFT_HEAD_FP8 == "1"
 # main_proj (15360 -> 5120 FP8, 79 MB) split by output rows over TP and
 # all-gathered, instead of read whole on every rank (default off).
 _DRAFT_PROJ_TP = envs.VLLM_V41_DRAFT_PROJ_TP == "1"
+# Coupled (keyed) B=1 drafts from vocabulary shards in their own graph; needs
+# VLLM_V41_MARKOV_SHARD=1. The check runs the full fused coupled path too and
+# counts rounds whose drafts differ (debug: one all-gather and a sync per round).
+_COUPLED_SHARD = __import__("os").environ.get("VLLM_V41_COUPLED_SHARD", "0") == "1"
+_COUPLED_SHARD_CHECK = (
+    __import__("os").environ.get("VLLM_V41_COUPLED_SHARD_CHECK", "0") == "1"
+)
 
 logger = init_logger(__name__)
 
@@ -407,6 +419,12 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             if vllm_config.speculative_config.enforce_eager
             else V41ContextGraphs(self.model.precompute_and_store_context_kv)
         )
+        self.coupled_graph = (
+            None
+            if vllm_config.speculative_config.enforce_eager
+            else V41CoupledDraftGraph(self._coupled_shard_draft)
+        )
+        self._coupled_check = [0, 0]  # rounds checked, rounds with different drafts
 
     def embed_input_ids(self, input_ids):
         return self.model.embed_tokens(input_ids)
@@ -531,6 +549,75 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         if anchor.numel() > 1 and self._markov_shard is None:
             return None  # batched drafts need the sharded Markov head
         return self.greedy_graph(hidden_states, anchor)
+
+    def _coupled_shard_draft(self, hidden_states, anchor, temperature, keys, positions):
+        from vllm.v1.spec_decode.coupled_draw import DRAFT_TEMP_SCALE
+
+        from .markov_coupled import coupled_shard_tokens
+
+        return coupled_shard_tokens(
+            self._markov_shard,
+            self.local_logits(hidden_states),
+            anchor,
+            temperature,
+            keys,
+            positions,
+            DRAFT_TEMP_SCALE,
+        )
+
+    def coupled_shard_draft_tokens(
+        self, hidden_states, anchor, temperature, keys, positions
+    ):
+        """[5] coupled drafts for one request from vocabulary shards (graph),
+        or None unless VLLM_V41_COUPLED_SHARD=1 and the shard path is on."""
+        if not _COUPLED_SHARD or self._markov_shard is None:
+            return None
+        run = self.coupled_graph or self._coupled_shard_draft
+        tokens = run(hidden_states, anchor, temperature, keys, positions)
+        if _COUPLED_SHARD_CHECK:
+            self._coupled_shard_check(
+                hidden_states, anchor, temperature, keys, positions, tokens
+            )
+        return tokens
+
+    def _coupled_shard_check(
+        self, hidden_states, anchor, temperature, keys, positions, tokens
+    ):
+        """Debug: the full fused coupled drafts for the same round must equal
+        the shard drafts; logs the running count of rounds that differ."""
+        from vllm.v1.spec_decode.coupled_draw import DRAFT_TEMP_SCALE
+
+        from .markov_coupled import coupled_markov_tokens
+
+        steps = positions.shape[0]
+        full = coupled_markov_tokens(
+            self._markov,
+            self.compute_logits(hidden_states).view(1, steps, -1),
+            anchor,
+            temperature,
+            keys,
+            positions.view(1, steps),
+            DRAFT_TEMP_SCALE,
+        )[0]
+        same = bool(torch.equal(full, tokens))
+        self._coupled_check[0] += 1
+        self._coupled_check[1] += int(not same)
+        checked, differ = self._coupled_check
+        if not same:
+            logger.warning(
+                "V4.1 coupled shard self-check: drafts differ (shard %s, full %s); "
+                "%d of %d rounds differ",
+                tokens.tolist(),
+                full.tolist(),
+                differ,
+                checked,
+            )
+        elif checked % 200 == 0:
+            logger.info(
+                "V4.1 coupled shard self-check: %d of %d rounds differ",
+                differ,
+                checked,
+            )
 
     def coupled_draft_tokens(
         self, base_logits, prev, temperature, keys, positions, scale
