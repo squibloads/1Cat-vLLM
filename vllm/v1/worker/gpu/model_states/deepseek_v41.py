@@ -185,7 +185,8 @@ class DeepseekV41ModelState(DefaultModelState):
                 "DeepSeek-V4.1 under Model Runner V2 expects 1D positions and "
                 "text-only inputs; got M-RoPE or multimodal inputs."
             )
-        if vllm_config.kernel_config.tp_prefill_overlap_min_tokens > 0:
+        # Main has no TP prefill overlap (upstream #1282 is only in the PLI tree).
+        if getattr(vllm_config.kernel_config, "tp_prefill_overlap_min_tokens", 0) > 0:
             raise ValueError(
                 "DeepSeek-V4.1 under Model Runner V2 does not support "
                 "tp_prefill_overlap_min_tokens > 0: its cache builder admits "
