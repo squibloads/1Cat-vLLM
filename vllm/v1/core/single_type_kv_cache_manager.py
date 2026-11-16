@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Sequence
@@ -29,6 +30,14 @@ from vllm.v1.kv_cache_interface import (
     TQFullAttentionSpec,
 )
 from vllm.v1.request import Request
+
+_V41_KEEP_DECODE_WINDOW = (
+    os.environ.get("VLLM_V41_SESSION_PREFIX") == "1"
+    and os.environ.get("VLLM_V41_KEEP_DECODE_WINDOW", "1") == "1"
+)
+# How far behind the end of the last executed sequence a V4.1 session hit may land; same knob and default as
+# kv_cache_manager._V41_RING_REACH. The decode tail held for that hit has to reach back this far.
+_V41_RING_REACH = int(os.environ.get("VLLM_V41_RING_REACH", "124"))
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -604,6 +613,27 @@ class SingleTypeKVCacheManager(ABC):
         """
         # Remove the blocks that will be skipped during attention computation.
         num_skipped_tokens = self.get_num_skipped_tokens(processed_computed_tokens)
+        if (
+            _V41_KEEP_DECODE_WINDOW
+            and self.reuse_window is not None
+            and num_prompt_tokens is not None
+        ):
+            # The V4.1 session prefix resumes only from the end of the last executed sequence, and the lookup there
+            # needs a window-plus-EAGLE run of cached blocks. Decode blocks freed reuse-first are taken by the same
+            # request's next allocations, leaving that run a block short, so every follow-up after a reply longer
+            # than the window re-prefilled the conversation. So hold the decode tail such a hit can reach: it lands
+            # within _V41_RING_REACH of the end and needs the window-plus-EAGLE run before it, which this keeps
+            # with a block to spare. Holding every decode block instead (pc2-pc8) grew the request one block per
+            # 16 generated tokens until it filled the pool (~20.3K output tokens at 80 MiB) and was preempted
+            # (Bug 1660). Up to that reach the prompt-anchored bound below is unchanged.
+            keep_from = max(
+                num_prompt_tokens - self.reuse_window - 2 * self.block_size,
+                processed_computed_tokens
+                - self.reuse_window
+                - _V41_RING_REACH
+                - 4 * self.block_size,
+            )
+            num_skipped_tokens = min(num_skipped_tokens, max(0, keep_from))
         if num_skipped_tokens <= 0:
             # This indicates that ALL tokens are inside attention window.
             # Thus we do not need to free any blocks outside attention window.
