@@ -743,6 +743,11 @@ def render_message(
             )
 
         summary_content = content or ""
+        if tool_calls:
+            # The model writes "\n\n" before the DSML block and the streaming tool parser returns it as content;
+            # tc_content re-adds it, so a replayed turn would carry it twice and stop matching the executed
+            # tokens, which costs the session prefix cache its hit on every agent tool loop.
+            summary_content = summary_content.removesuffix("\n\n")
         rc = reasoning_content or ""
 
         # Check if previous message has a task - if so, this is a task output (no thinking)
