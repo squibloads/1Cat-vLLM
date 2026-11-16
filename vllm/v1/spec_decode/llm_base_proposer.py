@@ -204,6 +204,16 @@ def _sync_draft_token_ids_across_tp(
 
     if not next_token_ids.is_contiguous():
         next_token_ids = next_token_ids.contiguous()
+    # torch.distributed.broadcast would lazily build a second NCCL communicator
+    # (about 420-520 MiB per rank); the CUDA communicator's pynccl broadcast
+    # moves the same ids. VLLM_V41_DRAFT_SYNC_PYNCCL=0 restores the old path.
+    comm = getattr(tp_group, "device_communicator", None)
+    if (
+        os.environ.get("VLLM_V41_DRAFT_SYNC_PYNCCL", "1") == "1"
+        and getattr(comm, "pynccl_comm", None) is not None
+        and not comm.pynccl_comm.disabled
+    ):
+        return comm.broadcast(next_token_ids, src=0)
     return tp_group.broadcast(next_token_ids, src=0)
 
 
