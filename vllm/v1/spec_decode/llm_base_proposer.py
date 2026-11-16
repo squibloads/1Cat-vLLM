@@ -408,8 +408,12 @@ class SpecDecodeBaseProposer:
                 (self.max_num_tokens,), dtype=torch.bool, device=device
             )
 
+        # Every read is under supports_mm_inputs; a text-only drafter keeps one row.
         self.inputs_embeds = torch.zeros(
-            (self.max_num_tokens, self.inputs_embeds_size),
+            (
+                self.max_num_tokens if self.supports_mm_inputs else 1,
+                self.inputs_embeds_size,
+            ),
             dtype=self.dtype,
             device=device,
         )

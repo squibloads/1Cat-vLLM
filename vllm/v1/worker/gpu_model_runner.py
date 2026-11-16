@@ -1706,8 +1706,15 @@ class GPUModelRunner(
         # Because inputs_embeds may be bfloat16 and we don't need a numpy
         # version of this tensor, avoid a RuntimeError by not creating a
         # numpy buffer.
+        # Every read is under multimodal or prompt-embeds input; a text-only
+        # model keeps one row.
         self.inputs_embeds = self._make_buffer(
-            self.max_num_tokens, self.inputs_embeds_size, dtype=self.dtype, numpy=False
+            self.max_num_tokens
+            if (self.supports_mm_inputs or self.enable_prompt_embeds)
+            else 1,
+            self.inputs_embeds_size,
+            dtype=self.dtype,
+            numpy=False,
         )
         if self.uses_ngram_embedding:
             self.ngram_context = self._make_buffer(
