@@ -11,6 +11,8 @@ from collections.abc import Callable, Iterable
 from copy import copy
 from typing import Any
 
+import os
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -330,6 +332,9 @@ def _index_all_gather():
     return tensor_model_parallel_all_gather
 
 
+_ENGRAM_ROWS = int(os.environ.get("VLLM_V41_ENGRAM_ROWS", "1024"))
+
+
 class V41Engram(nn.Module):
     def __init__(self, config, quant_config, layer, prefix):
         super().__init__()
@@ -351,10 +356,27 @@ class V41Engram(nn.Module):
 
     def forward(self, x, io, valid_tokens):
         embedding = io.runtime.lookup(self.channel, x.shape[0])
-        projected = tensor_model_parallel_all_gather(self.wkv(embedding), dim=-1)
-        return apply_engram_gate(
-            x, projected, self.q_weight, self.k_weight, valid_tokens, inplace=True
-        )
+        local = self.wkv(embedding)
+        if _ENGRAM_ROWS <= 0 or x.shape[0] <= _ENGRAM_ROWS:
+            projected = tensor_model_parallel_all_gather(local, dim=-1)
+            return apply_engram_gate(
+                x, projected, self.q_weight, self.k_weight, valid_tokens, inplace=True
+            )
+        # The gathered block and its movedim copy are both live (800 MiB at an
+        # 8K chunk). The gate is per row and the gather is a copy, so row
+        # blocks are bit-identical.
+        for start in range(0, x.shape[0], _ENGRAM_ROWS):
+            end = min(start + _ENGRAM_ROWS, x.shape[0])
+            projected = tensor_model_parallel_all_gather(local[start:end], dim=-1)
+            apply_engram_gate(
+                x[start:end],
+                projected,
+                self.q_weight,
+                self.k_weight,
+                None if valid_tokens is None else valid_tokens[start:end],
+                inplace=True,
+            )
+        return x
 
 
 class V41Compressor(nn.Module):
