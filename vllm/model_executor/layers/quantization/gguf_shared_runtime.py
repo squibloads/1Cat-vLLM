@@ -561,6 +561,11 @@ class SharedExpertRank:
             _ALL_RANKS.append(self)
             self.free_swap = (envs.VLLM_V41_SWAP_FREE or "0") == "1"
             self.inplace = self.free_swap or (envs.VLLM_V41_SWAP_INPLACE or "0") == "1"
+            # Copy-swap mode (VLLM_V41_SWAP_FREE=0, no SWAP_INPLACE) has no async
+            # eviction lane, but wait_jobs() runs on every prefill in every mode;
+            # _init_inplace() replaces these for the in-place and free modes.
+            self.async_evict = False
+            self.job_lane = None
             if self.inplace:
                 self._init_inplace()
         except BaseException:
