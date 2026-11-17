@@ -38,25 +38,30 @@ struct SharedEngramTable {
 // consume its previous sequence.
 class SharedEngramReader {
  public:
-  static constexpr uint64_t kChannels = 2, kRanks = 4, kHeader = 8;
+  static constexpr uint64_t kChannels = 2, kHeader = 8, kMaxRanks = 64;
 
   static uint64_t rank_words(uint64_t maximum) { return maximum + 8; }
-  static uint64_t channel_words(uint64_t maximum) {
-    return kHeader + kRanks * rank_words(maximum);
+  // ranks: the tensor-parallel group that shares one reader (4 or 8).
+  static uint64_t channel_words(uint64_t maximum, uint64_t ranks) {
+    return kHeader + ranks * rank_words(maximum);
   }
-  static uint64_t control_words(uint64_t maximum) {
-    return kChannels * channel_words(maximum);
+  static uint64_t control_words(uint64_t maximum, uint64_t ranks) {
+    return kChannels * channel_words(maximum, ranks);
   }
 
   SharedEngramReader(uint8_t* data, uint64_t bytes, uint64_t* control,
                      uint64_t maximum, uint64_t row_bytes,
-                     std::vector<SharedEngramTable> tables, uint64_t timeout_ns)
+                     std::vector<SharedEngramTable> tables, uint64_t timeout_ns,
+                     uint64_t ranks)
       : data_(data),
         control_(control),
         maximum_(maximum),
         row_bytes_(row_bytes),
         timeout_(timeout_ns),
+        ranks_(ranks),
         tables_(std::move(tables)) {
+    if (!ranks || ranks > kMaxRanks)
+      throw std::runtime_error("shared Engram rank count out of range");
     if (!data || !control || reinterpret_cast<uintptr_t>(control) % 64 ||
         !maximum || maximum > 16384 * 24 ||
         (row_bytes != 144 && row_bytes != 264) || tables_.size() != kChannels ||
@@ -74,7 +79,7 @@ class SharedEngramReader {
           throw std::runtime_error("cannot duplicate Engram source fd");
         fds_.push_back(fd);
       }
-      std::fill_n(control_, control_words(maximum), 0);
+      std::fill_n(control_, control_words(maximum, ranks_), 0);
       // Rows are 144-byte IQ4_NL (GGUF sidecar) or 264-byte E4M3+E8M0
       // (native checkpoint tables). A short decode reads at most 144 rows per
       // channel. Creating and
@@ -124,7 +129,9 @@ class SharedEngramReader {
   static void store(uint64_t* p, uint64_t v) {
     __atomic_store_n(p, v, __ATOMIC_RELEASE);
   }
-  uint64_t* header(size_t c) { return control_ + c * channel_words(maximum_); }
+  uint64_t* header(size_t c) {
+    return control_ + c * channel_words(maximum_, ranks_);
+  }
   uint64_t* rank(size_t c, size_t r) {
     return header(c) + kHeader + r * rank_words(maximum_);
   }
@@ -233,7 +240,7 @@ class SharedEngramReader {
         bool work = false;
         for (size_t c = 0; c < kChannels; ++c) {
           bool all = true, consumed = true;
-          for (size_t r = 0; r < kRanks; ++r) {
+          for (size_t r = 0; r < ranks_; ++r) {
             auto* request = rank(c, r);
             const auto tag = load(request);
             if (tag > sequence[c])
@@ -248,7 +255,7 @@ class SharedEngramReader {
           const auto count = rank(c, 0)[2];
           if (!count || count > maximum_)
             throw std::runtime_error("invalid shared Engram row count");
-          for (size_t r = 1; r < kRanks; ++r) {
+          for (size_t r = 1; r < ranks_; ++r) {
             if (rank(c, r)[2] != count ||
                 !std::equal(rank(c, 0) + 8, rank(c, 0) + 8 + count,
                             rank(c, r) + 8))
@@ -274,7 +281,7 @@ class SharedEngramReader {
 
   uint8_t* data_;
   uint64_t* control_;
-  uint64_t maximum_, row_bytes_, timeout_;
+  uint64_t maximum_, row_bytes_, timeout_, ranks_;
   std::vector<SharedEngramTable> tables_;
   std::vector<int> fds_;
   std::atomic<bool> stopped_{false};

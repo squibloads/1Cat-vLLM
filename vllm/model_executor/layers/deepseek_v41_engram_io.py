@@ -111,13 +111,13 @@ def _fingerprint(specs, maximum):
 
 
 class SharedEngramOwner:
-    def __init__(self, specs, max_tokens=2048, timeout_ns=60_000_000_000):
+    def __init__(self, specs, max_tokens=2048, timeout_ns=60_000_000_000, ranks=4):
         if len(specs) != 2 or not 1 <= max_tokens <= 16384:
             raise ValueError("V4.1 Engram requires two bounded table channels")
         maximum = max_tokens * 24
         row_bytes = _row_bytes(specs)
         native = _native()
-        words, channel_words, _ = native.shared_engram_control_layout(maximum)
+        words, channel_words, _ = native.shared_engram_control_layout(maximum, ranks)
         self.data = self.control = self.reader = None
         try:
             self.data = SharedHostArena.create(
@@ -286,8 +286,10 @@ def decode_native_rows(raw, bias):
 class SharedEngramRank:
     """Per-process CUDA registration; each GPU dequantizes the shared raw rows."""
 
-    def __init__(self, data, control, rank, specs, max_tokens=2048, channels=(0, 1)):
-        if rank not in range(4) or torch.accelerator.current_device_index() != rank:
+    def __init__(
+        self, data, control, rank, specs, max_tokens=2048, channels=(0, 1), ranks=4
+    ):
+        if rank not in range(ranks) or torch.accelerator.current_device_index() != rank:
             raise ValueError("Select the TP rank's CUDA device before mapping Engram")
         self.data, self.control, self.rank = data, control, rank
         self.maximum = max_tokens * 24
@@ -299,7 +301,7 @@ class SharedEngramRank:
             raise ValueError("V4.1 Engram channels must be a subset of (0, 1)")
         self.native = _native()
         words, self.channel_words, self.rank_words = (
-            self.native.shared_engram_control_layout(self.maximum)
+            self.native.shared_engram_control_layout(self.maximum, ranks)
         )
         if data.size < 2 * self.maximum * self.row_bytes or control.size < words * 8:
             raise ValueError("Engram mapping is smaller than its declared capacity")
@@ -459,8 +461,8 @@ class SharedEngramIO:
             from vllm.distributed import get_tp_group
 
             group = get_tp_group()
-        if group.world_size != 4:
-            raise ValueError("V4.1 shared Engram currently requires local TP4")
+        if group.world_size not in (4, 8):
+            raise ValueError("V4.1 shared Engram requires local TP4 or TP8")
         specs = group.broadcast_object(
             engram_table_specs(path) if group.rank_in_group == 0 else None, src=0
         )
@@ -472,7 +474,11 @@ class SharedEngramIO:
             active = specs[channels[0]]
             specs = tuple(specs[c] if c in channels else active for c in range(2))
         self.owner, self.data, self.control = _join_shared_group(
-            None, group, owner_factory=lambda: SharedEngramOwner(specs, max_tokens)
+            None,
+            group,
+            owner_factory=lambda: SharedEngramOwner(
+                specs, max_tokens, ranks=group.world_size
+            ),
         )
         self.runtime = None
         try:

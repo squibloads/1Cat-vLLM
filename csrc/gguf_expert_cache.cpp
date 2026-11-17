@@ -799,9 +799,9 @@ void copy_h2d_2d(const std::vector<int64_t>& dst,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   using namespace vllm::gguf;
-  m.def("shared_engram_control_layout", [](uint64_t maximum) {
-    return std::vector<uint64_t>{SharedEngramReader::control_words(maximum),
-                                 SharedEngramReader::channel_words(maximum),
+  m.def("shared_engram_control_layout", [](uint64_t maximum, uint64_t ranks) {
+    return std::vector<uint64_t>{SharedEngramReader::control_words(maximum, ranks),
+                                 SharedEngramReader::channel_words(maximum, ranks),
                                  SharedEngramReader::rank_words(maximum)};
   });
   pybind11::class_<SharedEngramTable>(m, "SharedEngramTable")
@@ -812,11 +812,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def(pybind11::init([](uint64_t data, uint64_t bytes, uint64_t control,
                              uint64_t maximum, uint64_t row_bytes,
                              std::vector<SharedEngramTable> tables,
-                             uint64_t timeout_ns) {
+                             uint64_t timeout_ns, uint64_t ranks) {
         return std::make_unique<SharedEngramReader>(
             reinterpret_cast<uint8_t*>(data), bytes,
             reinterpret_cast<uint64_t*>(control), maximum, row_bytes,
-            std::move(tables), timeout_ns);
+            std::move(tables), timeout_ns, ranks);
       }))
       .def("stop", &SharedEngramReader::stop,
            pybind11::call_guard<pybind11::gil_scoped_release>())
