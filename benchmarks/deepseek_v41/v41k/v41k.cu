@@ -1345,8 +1345,8 @@ __global__ void __launch_bounds__(512, V41K_GU_MINB)
   }
   const int lrow = warp * 2 + lane / 16;
   const int row = blockIdx.x * 32 + lrow;
-  const uint8_t* g = gate + (int64_t(e) * 576 + row) * row_stride;
-  const uint8_t* u = up + (int64_t(e) * 576 + row) * row_stride;
+  const uint8_t* g = gate + (int64_t(e) * (gridDim.x * 32) + row) * row_stride;
+  const uint8_t* u = up + (int64_t(e) * (gridDim.x * 32) + row) * row_stride;
   int tok[6];
 #pragma unroll
   for (int c = 0; c < 6; ++c) tok[c] = c < cnt ? s_tok[c] : 0;
@@ -1387,7 +1387,7 @@ __global__ void __launch_bounds__(512, V41K_GU_MINB)
     const float act = __fdiv_rn(g16, __fadd_rn(1.f, expf(-g16)));
     const float value = __half2float(
         __float2half_rn(__fmul_rn(__fmul_rn(act, u16), prob[route])));
-    q8_warp_aligned(hq, hd, int64_t(route) * 18 + blockIdx.x, value);
+    q8_warp_aligned(hq, hd, int64_t(route) * gridDim.x + blockIdx.x, value);
   }
 }
 
@@ -1559,14 +1559,14 @@ __global__ void __launch_bounds__(128)
   }
 }
 
-template <int Type, int NW>
+template <int Type, int NW, int LG = 18>
 __global__ void __launch_bounds__(32 * NW, 8 / NW * 4)
     down_em6(half* __restrict__ out, const int8_t* __restrict__ hq,
              const float* __restrict__ hd, const int* ids,
              const uint8_t* __restrict__ down, int row_stride, int left_groups,
              const uint32_t* __restrict__ gbook, int routes, int top_k,
              int tokens, int rows_per_cta, const int* __restrict__ plan) {
-  constexpr int GROUPS = 18, N = 5120, BW = book_words<Type>();
+  constexpr int GROUPS = LG, N = 5120, BW = book_words<Type>();
   __shared__ __align__(16) uint32_t book[BW];
   __shared__ int distinct_e[36], s_nu, member_route[36][6], member_cnt[36];
   __shared__ uint32_t masks[16];
@@ -3761,6 +3761,9 @@ void v41k_moe7(torch::Tensor out, torch::Tensor xq, torch::Tensor xd,
   const at::cuda::OptionalCUDAGuard guard(out.device());
   const int routes = ids32.numel(), tokens = out.size(0);
   TORCH_CHECK(routes <= 36 && plan.numel() >= 73 + 216);
+  // Slice width in groups of 32: 18 at TP4 (576 columns), 9 at TP8 (288).
+  const int lg = int(hq.size(1));
+  TORCH_CHECK(lg == 18 || lg == 9, "moe7: slice must be 18 or 9 groups of 32");
   auto stream = at::cuda::getCurrentCUDAStream();
   auto i8 = [](torch::Tensor& t) {
     return reinterpret_cast<int8_t*>(t.data_ptr());
@@ -3768,7 +3771,7 @@ void v41k_moe7(torch::Tensor out, torch::Tensor xq, torch::Tensor xd,
   int* pl = plan.data_ptr<int>();
   v41k::moe_plan<<<1, 32, 0, stream>>>(pl, ids32.data_ptr<int>(), routes);
 #define V41K_GU7(T)                                                            \
-  v41k::gate_up_em5<T><<<dim3(18, routes), 512, 0, stream>>>(                  \
+  v41k::gate_up_em5<T><<<dim3(lg, routes), 512, 0, stream>>>(                  \
       i8(hq), hd.data_ptr<float>(), i8(xq), xd.data_ptr<float>(),              \
       ids32.data_ptr<int>(), prob.data_ptr<float>(), gate.data_ptr<uint8_t>(), \
       up.data_ptr<uint8_t>(), gate.size(2),                                    \
@@ -3780,11 +3783,20 @@ void v41k_moe7(torch::Tensor out, torch::Tensor xq, torch::Tensor xd,
   else
     V41K_GU7(29);
 #define V41K_DN7(T, W)                                                        \
-  v41k::down_em6<T, W><<<5120 / rows, 32 * W, 0, stream>>>(                   \
+  do {                                                                        \
+    if (lg == 9)                                                              \
+  v41k::down_em6<T, W, 9><<<5120 / rows, 32 * W, 0, stream>>>(                   \
       reinterpret_cast<half*>(out.data_ptr()), i8(hq), hd.data_ptr<float>(),  \
       ids32.data_ptr<int>(), down.data_ptr<uint8_t>(), down.size(2),          \
       left / 32, reinterpret_cast<const uint32_t*>(dbook.data_ptr()), routes, \
-      6, tokens, int(rows), pl)
+      6, tokens, int(rows), pl);                                                   \
+    else                                                                      \
+  v41k::down_em6<T, W, 18><<<5120 / rows, 32 * W, 0, stream>>>(                   \
+      reinterpret_cast<half*>(out.data_ptr()), i8(hq), hd.data_ptr<float>(),  \
+      ids32.data_ptr<int>(), down.data_ptr<uint8_t>(), down.size(2),          \
+      left / 32, reinterpret_cast<const uint32_t*>(dbook.data_ptr()), routes, \
+      6, tokens, int(rows), pl);                                                  \
+  } while (0)
   static const bool em8 = [] {
     const char* v = std::getenv("VLLM_V41_EM8");
     return v == nullptr || v[0] != '0';
@@ -3828,6 +3840,95 @@ void v41k_moe7(torch::Tensor out, torch::Tensor xq, torch::Tensor xd,
     else
       V41K_DN7(29, 4);
   }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// moe7f: the plan comes from q8_plan (no moe_plan launch), gate/up from the
+// persistent gate_up_fast<T, S>, then the column-split down_em6<T, W, LG>.
+// S = LG = 18 at TP4 (576 columns per rank), 9 at TP8 (288).
+template <int T, int S>
+static void v41k_guf_s(int grid, int8_t* hq, float* hd, const int8_t* xq,
+                       const float* xd, const float* prob, const uint8_t* gate,
+                       const uint8_t* up, int row_stride, const uint32_t* fbook,
+                       const int* plan, cudaStream_t stream) {
+  static bool carved = false;
+  if (!carved) {
+    v41k_fast_carveout(v41k_fast::gate_up_fast<T, S>);
+    carved = true;
+  }
+  v41k_fast::gate_up_fast<T, S><<<grid, 512, 0, stream>>>(
+      hq, hd, xq, xd, prob, gate, up, row_stride, fbook, plan);
+}
+
+void v41k_moe7f(torch::Tensor out, torch::Tensor xq, torch::Tensor xd,
+                torch::Tensor hq, torch::Tensor hd, torch::Tensor ids32,
+                torch::Tensor prob, torch::Tensor gate, torch::Tensor up,
+                torch::Tensor down, int64_t gtype, int64_t dtype, int64_t left,
+                torch::Tensor gfbook, torch::Tensor dbook, int64_t rows,
+                int64_t dn_warps, torch::Tensor plan) {
+  const at::cuda::OptionalCUDAGuard guard(out.device());
+  const int routes = ids32.numel(), tokens = out.size(0);
+  const int lg = int(hq.size(1));
+  TORCH_CHECK(routes >= 6 && routes <= 36 && routes % 6 == 0 &&
+                  plan.numel() >= 73 + 216 && (lg == 18 || lg == 9) &&
+                  gate.size(1) == lg * 32 && up.sizes() == gate.sizes(),
+              "moe7f: M x top-6 routes, plan, slice of 18 or 9 groups");
+  TORCH_CHECK(gtype == 16 || gtype == 17 || gtype == 29, "moe7f: gtype");
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto i8 = [](torch::Tensor& t) {
+    return reinterpret_cast<int8_t*>(t.data_ptr());
+  };
+  int* pl = plan.data_ptr<int>();
+  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const int grid = std::min(sms, lg * routes);
+  const auto* fb = reinterpret_cast<const uint32_t*>(gfbook.data_ptr());
+#define V41K_GUFS(T)                                                          \
+  do {                                                                        \
+    if (lg == 9)                                                              \
+      v41k_guf_s<T, 9>(grid, i8(hq), hd.data_ptr<float>(), i8(xq),            \
+                       xd.data_ptr<float>(), prob.data_ptr<float>(),          \
+                       gate.data_ptr<uint8_t>(), up.data_ptr<uint8_t>(),      \
+                       int(gate.size(2)), fb, pl, stream);                    \
+    else                                                                      \
+      v41k_guf_s<T, 18>(grid, i8(hq), hd.data_ptr<float>(), i8(xq),           \
+                        xd.data_ptr<float>(), prob.data_ptr<float>(),         \
+                        gate.data_ptr<uint8_t>(), up.data_ptr<uint8_t>(),     \
+                        int(gate.size(2)), fb, pl, stream);                   \
+  } while (0)
+  if (gtype == 16)
+    V41K_GUFS(16);
+  else if (gtype == 17)
+    V41K_GUFS(17);
+  else
+    V41K_GUFS(29);
+#undef V41K_GUFS
+#define V41K_DNF(T, W)                                                        \
+  do {                                                                        \
+    if (lg == 9)                                                              \
+      v41k::down_em6<T, W, 9><<<5120 / rows, 32 * W, 0, stream>>>(            \
+          reinterpret_cast<half*>(out.data_ptr()), i8(hq),                    \
+          hd.data_ptr<float>(), ids32.data_ptr<int>(),                        \
+          down.data_ptr<uint8_t>(), down.size(2), left / 32,                  \
+          reinterpret_cast<const uint32_t*>(dbook.data_ptr()), routes, 6,     \
+          tokens, int(rows), pl);                                             \
+    else                                                                      \
+      v41k::down_em6<T, W, 18><<<5120 / rows, 32 * W, 0, stream>>>(           \
+          reinterpret_cast<half*>(out.data_ptr()), i8(hq),                    \
+          hd.data_ptr<float>(), ids32.data_ptr<int>(),                        \
+          down.data_ptr<uint8_t>(), down.size(2), left / 32,                  \
+          reinterpret_cast<const uint32_t*>(dbook.data_ptr()), routes, 6,     \
+          tokens, int(rows), pl);                                             \
+  } while (0)
+  if (dn_warps == 8) {
+    if (dtype == 16) V41K_DNF(16, 8);
+    else if (dtype == 17) V41K_DNF(17, 8);
+    else V41K_DNF(29, 8);
+  } else {
+    if (dtype == 16) V41K_DNF(16, 4);
+    else if (dtype == 17) V41K_DNF(17, 4);
+    else V41K_DNF(29, 4);
+  }
+#undef V41K_DNF
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -4223,6 +4324,11 @@ TORCH_LIBRARY(v41k, m) {
       "Tensor gbook, Tensor dbook, int rows, int dn_warps, Tensor(d!) plan) -> "
       "()",
       &v41k_moe7);
+  m.def(
+      "moe7f(Tensor(a!) out, Tensor xq, Tensor xd, Tensor(b!) hq, Tensor(c!) hd, Tensor ids32, "
+      "Tensor prob, Tensor gate, Tensor up, Tensor down, int gtype, int dtype, int left, "
+      "Tensor gfbook, Tensor dbook, int rows, int dn_warps, Tensor plan) -> ()",
+      &v41k_moe7f);
   m.def(
       "swap_stage(Tensor(a!) b0, Tensor(b!) b1, Tensor(c!) b2, Tensor host, "
       "Tensor(d!) scratch, "

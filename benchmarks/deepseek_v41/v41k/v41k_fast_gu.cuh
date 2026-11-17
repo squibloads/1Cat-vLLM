@@ -127,9 +127,9 @@ struct GuUnit {
   int u, e, cnt, tok[6];  // tok[c] = (route / 6) * 160
 };
 __device__ __forceinline__ GuUnit gu_unit(const int* __restrict__ plan,
-                                          int unit) {
+                                          int unit, int slabs = 18) {
   GuUnit g;
-  g.u = unit / 18;
+  g.u = unit / slabs;
   g.e = __ldg(plan + 1 + g.u);
   g.cnt = __ldg(plan + 37 + g.u);
   #pragma unroll
@@ -163,7 +163,7 @@ __device__ __forceinline__ void gu_prefetch(const GuUnit& g, const int8_t* xq,
 // odd raw sets); the last two steps of a unit load the next unit's first two.
 // The next unit's member activations are prefetched into L1 when the unit
 // starts, the first unit's with its first weights.
-template <int Type>
+template <int Type, int S = 18>
 __global__ void __launch_bounds__(512, 1)
     gate_up_fast(int8_t* __restrict__ hq, float* __restrict__ hd,
                  const int8_t* __restrict__ xq, const float* __restrict__ xd,
@@ -175,7 +175,7 @@ __global__ void __launch_bounds__(512, 1)
   using FB = FastBook<Type>;
   using Raw = GuRaw<Type>;
   using Ptr = typename Raw::Ptr;
-  constexpr int STEPS = 10, SLABS = 18;
+  constexpr int STEPS = 10, SLABS = S;
   __shared__ __align__(16) uint32_t book[FB::kSmemWords];
   __shared__ float red[2][6][2][32];
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -186,9 +186,9 @@ __global__ void __launch_bounds__(512, 1)
   const int lrow = warp * 2 + lane / 16;
   const int boff = (l >> 3) * FB::kBlock;
   auto rows = [&](int un, int e) {
-    return (int64_t(e) * 576 + (un % SLABS) * 32 + lrow) * row_stride + boff;
+    return (int64_t(e) * (SLABS * 32) + (un % SLABS) * 32 + lrow) * row_stride + boff;
   };
-  GuUnit cur = gu_unit(plan, unit);
+  GuUnit cur = gu_unit(plan, unit, SLABS);
   Ptr pg(gate + rows(unit, cur.e), sub), pu(up + rows(unit, cur.e), sub);
   pg.pin();
   pu.pin();
@@ -210,7 +210,7 @@ __global__ void __launch_bounds__(512, 1)
   while (true) {
     const int nunit = unit + int(gridDim.x);
     const bool more = nunit < units;
-    const GuUnit nxt = more ? gu_unit(plan, nunit) : cur;
+    const GuUnit nxt = more ? gu_unit(plan, nunit, SLABS) : cur;
     if (more) gu_prefetch(nxt, xq, xd, t);
     float gs[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     float us[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
@@ -281,7 +281,7 @@ __global__ void __launch_bounds__(512, 1)
       const float act = __fdiv_rn(g16, __fadd_rn(1.f, expf(-g16)));
       const float value = __half2float(
           __float2half_rn(__fmul_rn(__fmul_rn(act, u16), prob[route])));
-      v41k::q8_warp_aligned(hq, hd, int64_t(route) * 18 + unit % SLABS, value);
+      v41k::q8_warp_aligned(hq, hd, int64_t(route) * SLABS + unit % SLABS, value);
     }
     if (!more) break;
     unit = nunit;
