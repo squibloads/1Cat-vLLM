@@ -52,12 +52,12 @@ def v41_fp16_experts(
         or source_type not in (16, 17, 29)
         or down_type not in (16, 17, 29)
         or gate.ndim != 3
-        or gate.shape[1] != 576
+        or gate.shape[1] not in (576, 288)
         or up.shape != gate.shape
         or down.ndim != 3
         or down.shape[1] != 5120
         or down.shape[0] != gate.shape[0]
-        or left not in (0, 64, 128, 192)
+        or left not in range(0, 256, 32)
         or maximum_bytes < 1024**2
         or any(
             bank.device != x.device
@@ -71,8 +71,8 @@ def v41_fp16_experts(
 
     block, size = quant_size(down_type)
     physical_k = down.shape[2] // size * block
-    if physical_k != 768:
-        raise ValueError("V4.1 FP16 down carrier must cover 768 columns")
+    if physical_k not in (768, 512):
+        raise ValueError("V4.1 FP16 down carrier must cover 768 (TP4) or 512 (TP8) columns")
     flat = ids.reshape(-1).long()
     outputs = torch.empty(x.shape[0] * 6, 5120, device=x.device, dtype=x.dtype)
 
@@ -93,7 +93,7 @@ def v41_fp16_experts(
         hidden = (
             torch.nn.functional.silu(g) * u * probabilities.reshape(-1)[route]
         ).half()
-        hidden = torch.nn.functional.pad(hidden, (left, physical_k - left - 576))
+        hidden = torch.nn.functional.pad(hidden, (left, physical_k - left - gate.shape[1]))
         outputs[route : route + 1].copy_(projection(down, down_type, route, hidden))
     return outputs.view(x.shape[0], 6, 5120).float().sum(1).half()
 
