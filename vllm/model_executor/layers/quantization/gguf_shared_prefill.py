@@ -250,11 +250,11 @@ class SharedOriginalPrefill:
         for spec in cache.specs:
             if spec.kinds[0] != spec.kinds[1]:
                 raise ValueError("V4.1 prefill requires matching gate and up formats")
-            rows = spec.intermediate // 4
+            rows = spec.intermediate // spec.tp
             gu = _canonical(spec.kinds[0], 2 * rows, spec.hidden)
             # Row-split down: N = hidden / 4 output rows, full K.
             dn_n, dn_k = (
-                (spec.hidden // 4, spec.intermediate)
+                (spec.hidden // spec.tp, spec.intermediate)
                 if DOWN_ROWS
                 else (spec.hidden, rows)
             )

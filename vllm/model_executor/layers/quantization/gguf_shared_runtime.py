@@ -57,6 +57,8 @@ class SharedExpertLayerSpec:
     experts: int
     resident: int
     kinds: tuple[int, int, int]
+    # Tensor-parallel ranks the layer's experts are split over.
+    tp: int = 4
 
     def __post_init__(self):
         object.__setattr__(self, "kinds", tuple(self.kinds))
@@ -64,13 +66,13 @@ class SharedExpertLayerSpec:
         # native coordinator still requires a nonempty cold set.
         if not 0 < self.resident <= self.experts or len(self.kinds) != 3:
             raise ValueError("Invalid shared expert layer specification")
-        for rank in range(4):
+        for rank in range(self.tp):
             self.layouts(rank)
 
     def layouts(self, rank):
         return tuple(
             SharedExpertLayout.for_type(
-                self.hidden, self.intermediate, 4, rank, role, kind
+                self.hidden, self.intermediate, self.tp, rank, role, kind
             )
             for role, kind in zip(SHARDS, self.kinds)
         )
@@ -248,7 +250,7 @@ class ResidentExpertRank:
         device = torch.device(device)
         if (
             not specs
-            or rank not in range(4)
+            or rank not in range(specs[0].tp if specs else 0)
             or device.type != "cuda"
             or torch.accelerator.current_device_index() != device.index
         ):
@@ -418,7 +420,7 @@ class SharedExpertRank:
         device = torch.device("cuda", rank) if device is None else torch.device(device)
         if (
             not specs
-            or rank not in range(4)
+            or rank not in range(specs[0].tp if specs else 0)
             or device.type != "cuda"
             or torch.accelerator.current_device_index() != device.index
         ):
@@ -667,7 +669,7 @@ class SharedExpertRank:
 
     def hint(self, gates, layer, inputs):
         experts = self.specs[0].experts
-        quarter = experts // 4
+        quarter = experts // self.specs[0].tp
         if layer not in self.hint_weights:
             # This rank's quarter of the next two routers, FP16 (only ranks
             # candidates; the exact FP32 router still decides routing).

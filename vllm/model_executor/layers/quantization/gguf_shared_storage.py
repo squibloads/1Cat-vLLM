@@ -60,10 +60,10 @@ def _join_shared_group(specs, group, owner_factory=None):
                 with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as server:
                     server.settimeout(60)
                     server.bind(path)
-                    server.listen(3)
+                    server.listen(group.world_size - 1)
                     group.broadcast_object((path, nonce, socket.gethostname()), src=0)
                     seen = set()
-                    for _ in range(3):
+                    for _ in range(group.world_size - 1):
                         connection, _ = server.accept()
                         with connection:
                             connection.settimeout(60)
@@ -77,7 +77,7 @@ def _join_shared_group(specs, group, owner_factory=None):
                             if (
                                 uid != os.getuid()
                                 or token != nonce
-                                or peer not in (1, 2, 3)
+                                or peer not in range(1, group.world_size)
                                 or peer in seen
                             ):
                                 raise RuntimeError("Invalid shared expert FD consumer")
@@ -121,16 +121,16 @@ def stage_device_problem(tp_world, tp_device, device, current, world, pp_size):
     rank (PP2 stage 2 runs TP ranks 0-3 on cuda:4-7). ``world`` is None when no
     global process group exists (single-process tests).
     """
-    if tp_world != 4:
-        return "the tensor-parallel group must have four ranks"
+    if tp_world not in (4, 8):
+        return "the tensor-parallel group must have four or eight ranks"
     if device.type != "cuda" or device.index is None:
         return "the pool needs an indexed CUDA device"
     if tp_device is not None and device != tp_device:
         return f"{device} is not the TP group's device {tp_device}"
     if device.index != current:
         return f"{device} is not the current device cuda:{current}"
-    if world is not None and world != 4 * pp_size:
-        return f"world size {world} is not 4 x {pp_size} pipeline stages"
+    if world is not None and world != tp_world * pp_size:
+        return f"world size {world} is not {tp_world} x {pp_size} pipeline stages"
     return None
 
 
@@ -204,7 +204,7 @@ class SharedOriginalExpertCache:
         for _, layer, method, kinds in layers:
             if (
                 not method.is_v41
-                or layer.tp_size != 4
+                or layer.tp_size != group.world_size
                 or layer.tp_rank != self.rank
                 or set(kinds) != set(SHARDS)
             ):
@@ -214,10 +214,11 @@ class SharedOriginalExpertCache:
             specs.append(
                 SharedExpertLayerSpec(
                     method.hidden_size,
-                    method.intermediate_size * 4,
+                    method.intermediate_size * group.world_size,
                     experts,
                     experts - cold,
                     tuple(kinds[s] for s in SHARDS),
+                    group.world_size,
                 )
             )
         if not specs or len({s.experts for s in specs}) != 1:
