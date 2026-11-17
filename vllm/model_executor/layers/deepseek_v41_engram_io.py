@@ -139,6 +139,7 @@ class SharedEngramOwner:
                         for fd, s in zip(files, specs)
                     ],
                     timeout_ns,
+                    ranks,
                 )
             finally:
                 for fd in files:
@@ -490,6 +491,7 @@ class SharedEngramIO:
                 specs,
                 max_tokens,
                 channels,
+                ranks=group.world_size,
             )
             self.runtime.warmup()
             torch.distributed.barrier(group=group.cpu_group)
