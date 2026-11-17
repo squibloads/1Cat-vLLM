@@ -374,7 +374,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                 and current_platform.is_device_capability(70)
                 and self.params_dtype == torch.float16
                 and (self.num_experts, self.hidden_size, self.intermediate_size)
-                == (384, 5120, 576)
+                in ((384, 5120, 576), (384, 5120, 288))
                 and self.swiglu_limit == 10.0
                 and self.weight_types["w1"] == self.weight_types["w3"]
                 and self.weight_types["w1"] in (16, 17, 29)

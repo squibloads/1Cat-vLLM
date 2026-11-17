@@ -432,7 +432,7 @@ def _v41_experts(
         or source_type not in (16, 17, 29)
         or down_type not in (16, 17, 29)
         or gate.ndim != 3
-        or gate.shape[1] != 576
+        or gate.shape[1] not in (576, 288)
     ):
         raise ValueError("V4.1 integer experts require FP16 M1..6, top-6 and clamp 10")
     if _expert_major_ready() and down.shape[1] == 1280:
@@ -454,9 +454,14 @@ def _v41_experts(
         m = x.shape[0]
         xq = torch.empty((m, 160, 32), dtype=torch.int8, device=x.device)
         xd = torch.empty((m, 160), dtype=torch.float32, device=x.device)
-        hq = torch.empty((m * 6, 18, 32), dtype=torch.int8, device=x.device)
-        hd = torch.empty((m * 6, 18), dtype=torch.float32, device=x.device)
-        torch.ops.v41k.q8_aligned(xq, xd, x.contiguous())
+        # Slice width in groups of 32: 18 at TP4, 9 at TP8.
+        groups = gate.shape[1] // 32
+        hq = torch.empty((m * 6, groups, 32), dtype=torch.int8, device=x.device)
+        hd = torch.empty((m * 6, groups), dtype=torch.float32, device=x.device)
+        # TP8 slices run moe7f, which quantizes x and builds the plan in q8_plan.
+        tp8_fast = groups == 9 and hasattr(torch.ops.v41k, "moe7f")
+        if not tp8_fast:
+            torch.ops.v41k.q8_aligned(xq, xd, x.contiguous())
         result = torch.empty_like(x)
         # Down tiles per type (V100 sweep): IQ1_M 8 warps x 16 rows, IQ2 4 x 8.
         rows, warps = (16, 8) if down_type == 29 else (8, 4)
@@ -479,7 +484,13 @@ def _v41_experts(
             rows,
             warps,
         )
-        if _EM7 and hasattr(torch.ops.v41k, "moe7"):
+        if tp8_fast:
+            plan = _plan(x.device)
+            torch.ops.v41k.q8_plan(xq, xd, x.contiguous(), args[5], plan)
+            fast_args = list(args)
+            fast_args[13] = _expert_fast_book(source_type, x.device)
+            torch.ops.v41k.moe7f(*fast_args, plan)
+        elif _EM7 and hasattr(torch.ops.v41k, "moe7"):
             # One warp plans distinct experts per layer instead of every CTA.
             torch.ops.v41k.moe7(*args, _plan(x.device))
         else:
