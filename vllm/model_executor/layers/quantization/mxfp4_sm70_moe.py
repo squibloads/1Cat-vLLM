@@ -299,7 +299,7 @@ def validate_mxfp4_sm70_moe_contract(
         hidden_size,
         intermediate_size_per_partition,
         tp_size,
-    ) == (128, 3, 5120, 576, 4):
+    ) in ((128, 3, 5120, 576, 4), (128, 3, 5120, 288, 8)):
         return
     if global_num_experts != _DEEPSEEK_V4_FLASH_NUM_EXPERTS:
         raise NotImplementedError(
