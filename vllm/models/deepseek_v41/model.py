@@ -98,6 +98,10 @@ from .quant_rope import apply_rope, attention_qdq, rope_table
 logger = init_logger(__name__)
 
 _HC_FUSED = envs.VLLM_V41_HC_FUSED == "1"
+# Tensor-parallel sizes with V4.1 kernels: TP4 (one NVLink board per stage) and
+# TP8 (every layer split over eight GPUs). Head, expert and Engram counts are
+# derived from the group size; this set only admits the sizes that were run.
+V41_TP_SIZES = (4, 8)
 _ROUTER_FUSED = envs.VLLM_V41_ROUTER_FUSED == "1"
 # Native decode: the shared expert runs on a side stream, overlapped with the
 # gate, routing and routed experts (both are short, latency-bound kernels).
@@ -464,7 +468,7 @@ class V41Indexer(nn.Module):
             raise RuntimeError("V4.1 tiled index policy was not initialized")
         if policy.enabled and not _PACKED_KV:
             raise ValueError("V4.1 tiled index requires packed KV")
-        self.heads = c.index_n_heads // 4
+        self.heads = c.index_n_heads // get_tensor_model_parallel_world_size()
         # The model adapter binds the effective policy before graph-key creation.
         policy.active = bool(_PACKED_KV and policy.enabled)
         self.index_scorer = (
@@ -480,7 +484,7 @@ class V41Indexer(nn.Module):
         self.weights_proj = ColumnParallelLinear(
             c.hidden_size, c.index_n_heads, prefix=prefix + ".weights_proj", **kwargs
         )
-        self.heads = c.index_n_heads // 4
+        self.heads = c.index_n_heads // get_tensor_model_parallel_world_size()
         # Score columns of the batched decode path: the longest admitted
         # context (per-request loops stop at that request's length).
         self.max_context = max(
@@ -751,7 +755,8 @@ class V41Attention(nn.Module):
         super().__init__()
         self.layer, self.shared = layer, shared
         self.ratio = c.compress_ratios[layer]
-        self.heads, self.groups = c.num_attention_heads // 4, c.o_groups // 4
+        tp = get_tensor_model_parallel_world_size()
+        self.heads, self.groups = c.num_attention_heads // tp, c.o_groups // tp
         self.rank = get_tensor_model_parallel_rank()
         kwargs = dict(bias=False, return_bias=False, quant_config=quant_config)
         self.wq_a = ReplicatedLinear(
@@ -2129,7 +2134,11 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
             not current_platform.is_cuda()
             or not current_platform.is_device_capability(70)
             or vllm_config.model_config.dtype != torch.float16
-            or get_tensor_model_parallel_world_size() != 4
+            or get_tensor_model_parallel_world_size() not in V41_TP_SIZES
+            or (
+                get_tensor_model_parallel_world_size() != 4
+                and p.pipeline_parallel_size != 1
+            )
             or p.pipeline_parallel_size not in ((1, 2, 4) if _NATIVE else (1, 2))
             or p.data_parallel_size != 1
             or p.enable_expert_parallel

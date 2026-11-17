@@ -41,7 +41,14 @@ from .contract import validate_runtime_geometry
 from .fp8_linear import V41Fp8LinearMethod
 from .markov_fused import MarkovGreedy, markov_bias
 from .markov_shard import MarkovShardGreedy
-from .model import V41Attention, V41Block, V41MoE, V41Norm, _SharedAttention
+from .model import (
+    V41_TP_SIZES,
+    V41Attention,
+    V41Block,
+    V41MoE,
+    V41Norm,
+    _SharedAttention,
+)
 from .quant_rope import apply_rope, attention_qdq, rope_table
 from .query_graph import (
     V41ContextGraphs,
@@ -381,7 +388,7 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             or tuple(c.dspark_target_layer_ids) != (37, 38, 39)
             or c.dspark_block_size != 5
             or c.dspark_markov_rank != 256
-            or get_tensor_model_parallel_world_size() != 4
+            or get_tensor_model_parallel_world_size() not in V41_TP_SIZES
             or draft_config.dtype != torch.float16
             or vllm_config.speculative_config.num_speculative_tokens != 5
             or any(c.compress_ratios)
