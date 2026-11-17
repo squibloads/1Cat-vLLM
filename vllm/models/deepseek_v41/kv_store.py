@@ -47,7 +47,7 @@ def _share_arena(size, group):
             with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as server:
                 server.settimeout(60)
                 server.bind(path)
-                server.listen(3)
+                server.listen(group.world_size - 1)
                 group.broadcast_object((path, nonce, socket.gethostname()), src=0)
                 seen = set()
                 for _ in range(group.world_size - 1):
